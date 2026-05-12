@@ -339,3 +339,80 @@ def destroy_ascend_model_parallel():
     if _DYNAMIC_EPLB:
         _DYNAMIC_EPLB.destroy()
     _DYNAMIC_EPLB = None
+
+
+def edge_cloud_broadcast_recv() -> tuple[dict[str, torch.Tensor | Any] | None, list[Handle], list[Callable[[], None]]]:
+    """Edge-cloud mode broadcast receive.
+
+    For NPU0 (pp_group.world_size == 2 and rank is Cloud/Edge NPU0):
+        - Async receive from PP peer via pp_group.irecv_tensor_dict()
+        - Sync broadcast metadata via broadcast_object
+        - postprocess broadcasts tensors only after handles complete
+    For non-NPU0:
+        - Async broadcast receive: receive metadata sync, then receive tensors async
+
+    Returns:
+        tuple of (tensor_dict, comm_handles, comm_postprocess)
+    """
+    pp_group = get_pp_group()
+    tp_group = get_tp_group()
+    is_pp_npu0 = (pp_group.world_size == 2)
+
+    if is_pp_npu0:
+        # NPU0: async receive from PP peer
+        tensor_dict, comm_handles, comm_postprocess = pp_group.irecv_tensor_dict()
+        assert tensor_dict is not None
+
+        # Immediately broadcast metadata (sync) so other TP ranks know tensor shapes
+        metadata_list, tensor_list = _split_tensor_dict(tensor_dict)
+        tp_group.broadcast_object(metadata_list, src=0)
+
+        # Define broadcast postprocess function (broadcast tensors only, metadata already sent)
+        def broadcast_postprocess():
+            _, tensor_list = _split_tensor_dict(tensor_dict) if tensor_dict else (None, [])
+            handles = []
+            for tensor in tensor_list:
+                if tensor.numel() == 0:
+                    continue
+                if tensor.is_cpu:
+                    handle = torch.distributed.broadcast(
+                        tensor, src=tp_group.ranks[0], group=tp_group.cpu_group, async_op=True
+                    )
+                else:
+                    handle = torch.distributed.broadcast(
+                        tensor, src=tp_group.ranks[0], group=tp_group.device_group, async_op=True
+                    )
+                handles.append(handle)
+            for handle in handles:
+                handle.wait()
+
+        comm_postprocess.append(broadcast_postprocess)
+        return tensor_dict, comm_handles, comm_postprocess
+    else:
+        # Non-NPU0: async broadcast receive via TP group
+        # Receive metadata sync first
+        metadata_list = tp_group.broadcast_object(None, src=0)
+        recv_tensor_dict: dict[str, torch.Tensor | Any] = {}
+        handles: list[Handle] = []
+        group = tp_group.device_group
+        metadata_group = tp_group.cpu_group
+
+        for key, value in metadata_list:
+            if isinstance(value, TensorMetadata):
+                tensor = torch.empty(value.size, dtype=value.dtype, device=value.device)
+                if tensor.numel() == 0:
+                    recv_tensor_dict[key] = tensor
+                    continue
+                if tensor.is_cpu:
+                    handle = torch.distributed.broadcast(
+                        tensor, src=tp_group.ranks[0], group=metadata_group, async_op=True
+                    )
+                else:
+                    handle = torch.distributed.broadcast(
+                        tensor, src=tp_group.ranks[0], group=group, async_op=True
+                    )
+                handles.append(handle)
+                recv_tensor_dict[key] = tensor
+            else:
+                recv_tensor_dict[key] = value
+        return recv_tensor_dict, handles, []

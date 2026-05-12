@@ -35,7 +35,7 @@ from vllm.config import CompilationMode, CUDAGraphMode, VllmConfig, get_layers_f
 from vllm.distributed import get_tensor_model_parallel_world_size, tensor_model_parallel_all_gather
 from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
-from vllm.distributed.parallel_state import get_dcp_group, get_dp_group, get_pcp_group, get_pp_group, get_tp_group
+from vllm.distributed.parallel_state import get_dcp_group, get_dp_group, get_pcp_group, get_pp_group, get_tp_group, is_edge_device, is_edge_cloud_pp_mode
 from vllm.forward_context import BatchDescriptor, get_forward_context
 from vllm.logger import logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -1416,8 +1416,9 @@ class NPUModelRunner(GPUModelRunner):
                     ]
 
             if not self.broadcast_pp_output:
-                # Common case.
-                if not get_pp_group().is_last_rank:
+                # In edge-cloud mode, Edge first stage (intermediate_tensors is None)
+                # should also return IntermediateTensors.
+                if not get_pp_group().is_last_rank or (is_edge_cloud_pp_mode() and intermediate_tensors is None):
                     # Return the intermediate tensors.
                     assert isinstance(hidden_states, IntermediateTensors)
                     hidden_states.kv_connector_output = kv_connector_output

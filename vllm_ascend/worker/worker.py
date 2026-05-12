@@ -31,7 +31,8 @@ from vllm.config import CUDAGraphMode, VllmConfig, set_current_vllm_config
 from vllm.distributed import ensure_model_parallel_initialized, init_distributed_environment
 from vllm.distributed.ec_transfer import ensure_ec_transfer_initialized
 from vllm.distributed.kv_transfer import ensure_kv_transfer_initialized, get_kv_transfer_group, has_kv_transfer_group
-from vllm.distributed.parallel_state import Handle, get_pp_group, get_tp_group
+from vllm.distributed.parallel_state import Handle, get_pp_group, get_tp_group, is_cloud_device, is_edge_device
+from vllm_ascend.distributed.parallel_state import edge_cloud_broadcast_recv
 from vllm.logger import logger
 from vllm.lora.request import LoRARequest
 from vllm.sequence import IntermediateTensors
@@ -375,22 +376,36 @@ class NPUWorker(WorkerBase):
 
         intermediate_tensors = None
         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
-        if forward_pass and not get_pp_group().is_first_rank:
-            # If flashcomm1 is used, this all_gather_group parameter needs to be removed, otherwise
-            # it will conflict with the all-gather operation in flashcomm1.
-            if enable_sp():
-                all_gather_group = None
-            else:
-                all_gather_group = get_tp_group()
-            tensor_dict, comm_handles, comm_postprocess = get_pp_group().irecv_tensor_dict(
-                all_gather_group=all_gather_group
-            )
-            assert tensor_dict is not None
-            intermediate_tensors = AsyncIntermediateTensors(
-                tensor_dict,
-                comm_handles=comm_handles,
-                comm_postprocess=comm_postprocess,
-            )
+
+        if forward_pass:
+            # Cloud side in edge-cloud mode: unified broadcast receive for NPU0 and non-NPU0
+            if is_cloud_device():
+                tensor_dict, handles, postprocess = edge_cloud_broadcast_recv()
+                intermediate_tensors = AsyncIntermediateTensors(
+                    tensor_dict,
+                    comm_handles=handles,
+                    comm_postprocess=postprocess,
+                )
+                model = self.model_runner.model
+                num_layers = len(model.model.layers) if hasattr(model, 'model') and hasattr(model.model, 'layers') else 0
+                logger.info(f"[Cloud] PP stage: middle, rank={self.rank}, local_rank={self.local_rank}, num_layers={num_layers}")
+            # Non-edge-cloud PP: original async recv
+            elif not get_pp_group().is_first_rank:
+                # If flashcomm1 is used, this all_gather_group parameter needs to be removed, otherwise
+                # it will conflict with the all-gather operation in flashcomm1.
+                if enable_sp():
+                    all_gather_group = None
+                else:
+                    all_gather_group = get_tp_group()
+                tensor_dict, comm_handles, comm_postprocess = get_pp_group().irecv_tensor_dict(
+                    all_gather_group=all_gather_group
+                )
+                assert tensor_dict is not None
+                intermediate_tensors = AsyncIntermediateTensors(
+                    tensor_dict,
+                    comm_handles=comm_handles,
+                    comm_postprocess=comm_postprocess,
+                )
 
         output = self.model_runner.execute_model(scheduler_output, intermediate_tensors)
         if isinstance(output, (ModelRunnerOutput, AsyncModelRunnerOutput, NoneType)):
@@ -398,17 +413,47 @@ class NPUWorker(WorkerBase):
 
         assert isinstance(output, IntermediateTensors)
         parallel_config = self.vllm_config.parallel_config
-        assert parallel_config.distributed_executor_backend != ("external_launcher") and not get_pp_group().is_last_rank
-        # If flashcomm1 is used, this all_gather_group parameter needs to be removed, otherwise
-        # it will conflict with the all-gather operation in flashcomm1.
-        if enable_sp():
-            all_gather_group = None
+
+        # Edge side: unified broadcast receive for NPU0 and non-NPU0
+        if is_edge_device():
+            # Edge NPU0 sends first stage output before recv (async)
+            if get_pp_group().world_size == 2:
+                logger.info(f"[Edge] PP stage: first (send), rank={self.rank}, local_rank={self.local_rank}")
+                self._pp_send_work = get_pp_group().isend_tensor_dict(output.tensors)
+            # Unified broadcast receive
+            tensor_dict, handles, postprocess = edge_cloud_broadcast_recv()
+            intermediate_tensors = AsyncIntermediateTensors(
+                tensor_dict,
+                comm_handles=handles,
+                comm_postprocess=postprocess,
+            )
+            # Get model layer info for debug output
+            model = self.model_runner.model
+            num_layers = len(model.model.layers) if hasattr(model, 'model') and hasattr(model.model, 'layers') else 0
+            logger.info(f"[Edge] PP stage: last, rank={self.rank}, local_rank={self.local_rank}, num_layers={num_layers}")
+            output = self.model_runner.execute_model(scheduler_output, intermediate_tensors)
+            if isinstance(output, (ModelRunnerOutput, AsyncModelRunnerOutput, NoneType)):
+                return output
+            return output
+
+        # Cloud NPU0: send result back to Edge NPU0 (async)
+        elif is_cloud_device():
+            if get_pp_group().world_size == 2:
+                logger.info(f"[Cloud] PP stage: last (send back to Edge), rank={self.rank}, local_rank={self.local_rank}")
+                self._pp_send_work = get_pp_group().isend_tensor_dict(output.tensors)
+        # Non-edge-cloud PP: original async send
         else:
-            all_gather_group = get_tp_group()
-        self._pp_send_work = get_pp_group().isend_tensor_dict(
-            output.tensors,
-            all_gather_group=all_gather_group,
-        )
+            assert parallel_config.distributed_executor_backend != ("external_launcher") and not get_pp_group().is_last_rank
+            # If flashcomm1 is used, this all_gather_group parameter needs to be removed, otherwise
+            # it will conflict with the all-gather operation in flashcomm1.
+            if enable_sp():
+                all_gather_group = None
+            else:
+                all_gather_group = get_tp_group()
+            self._pp_send_work = get_pp_group().isend_tensor_dict(
+                output.tensors,
+                all_gather_group=all_gather_group,
+            )
 
         kv_connector_output = output.kv_connector_output
         if not kv_connector_output:
