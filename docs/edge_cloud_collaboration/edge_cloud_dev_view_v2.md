@@ -17,7 +17,6 @@ graph TB
         subgraph EdgeWorker["边侧 Worker — 首尾层"]
             L0[Layer 0<br/>Embedding + 首Transformer层]
             LN[Layer N-1<br/>末Transformer层 + Output]
-            EKV[Edge KV Cache Manager]
         end
     end
 
@@ -27,13 +26,11 @@ graph TB
 
         subgraph CloudWorker["云侧 Worker — 中间层"]
             LM[Layer 1 ~ Layer N-2<br/>中间Transformer层]
-            CKV[Cloud KV Cache Manager]
         end
     end
 
     subgraph Comm["边云通信层 (HCCL)"]
         PP[HCCL PP Channel]
-        KV[KV Transfer]
     end
 
     %% 请求流转
@@ -53,13 +50,6 @@ graph TB
     EXEC -->|返回结果| API
     API -->|HTTP| C
 
-    %% KV Cache
-    L0 <-->|KV read/write| EKV
-    LN <-->|KV read/write| EKV
-    LM <-->|KV read/write| CKV
-    EKV <-->|KV sync| KV
-    KV <-->|KV sync| CKV
-
     %% 样式
     classDef edge fill:#e1f5fe,stroke:#01579b,stroke-width:2px
     classDef cloud fill:#fff3e0,stroke:#e65100,stroke-width:2px
@@ -67,9 +57,9 @@ graph TB
     classDef client fill:#e8f5e9,stroke:#1b5e20,stroke-width:2px
     classDef core fill:#fff9c4,stroke:#f57f17,stroke-width:2px
 
-    class API,SCHED,EXEC,L0,LN,EKV edge
-    class CEXEC,LM,CKV cloud
-    class PP,KV comm
+    class API,SCHED,EXEC,L0,LN edge
+    class CEXEC,LM cloud
+    class PP comm
     class C client
     class EC core
 ```

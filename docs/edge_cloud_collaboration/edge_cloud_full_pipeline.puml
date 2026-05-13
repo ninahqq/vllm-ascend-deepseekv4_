@@ -1,0 +1,86 @@
+@startuml
+skinparam backgroundColor #FEFEFE
+skinparam handwritten false
+skinparam defaultTextAlignment center
+
+|#E1F5FE|边侧主进程|
+|#FFF3E0|边侧 NPUWorkers|
+|#E8F5E9|云侧 NPUWorkers|
+
+|边侧主进程|
+start
+:LLM.generate;
+:LLM._add_request;
+:EngineCore.add_request;
+:Scheduler.add_request
+(waiting 队列);
+:LLMEngine.step;
+:EngineCore.step_fn;
+:Scheduler.schedule
+(产出 SchedulerOutput);
+:AscendMultiprocExecutor
+.execute_model;
+
+:MQ.enqueue
+(broadcast execute_model);
+
+|边侧 NPUWorkers|
+:WorkerProc.worker_busy_loop;
+:WorkerProc.dequeue
+(反序列化请求);
+:NPUWorker.execute_model;
+:NPUModelRunner.execute_model;
+
+if (is_first_pp_rank?) then (yes)
+    :Embedding + Layer 0
+    (MLA + MoE);
+    :isend_tensor_dict
+    IntermediateTensors;
+    |云侧 NPUWorkers|
+    :irecv_tensor_dict
+    IntermediateTensors;
+    :_model_forward
+    Layer 1 ~ Layer N-2;
+    :compute_logits;
+    :sample token ids;
+    :broadcast
+    sampled token ids;
+    |边侧 NPUWorkers|
+    :receive token ids;
+    :Layer N-1
+    (Output Layer);
+    :assemble
+    ModelRunnerOutput;
+else (no)
+    :TP all_reduce
+    中间激活值;
+endif
+
+:worker_response_mq
+返回结果;
+
+|边侧主进程|
+:collect outputs
+from all workers;
+:OutputProcessor
+(detokenize);
+:返回 CompletionOutput;
+stop
+
+|边侧 NPUWorkers|
+note right
+  **边侧 Worker 内部通信:**
+  • TP Group: all_reduce (HCCL)
+  • EP Group: all_to_all TokenDispatch
+  • PP Group: isend/irecv 到云侧 NPU0
+end note
+
+|云侧 NPUWorkers|
+note right
+  **云侧 Worker 内部通信:**
+  • TP Group: all_reduce (HCCL)
+  • EP Group: all_to_all TokenDispatch
+  • PP Group: irecv/isend 到边侧 NPU0
+end note
+
+@enduml
