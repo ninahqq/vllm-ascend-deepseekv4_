@@ -1,9 +1,9 @@
 ```mermaid
 sequenceDiagram
     autonumber
-    participant C as 客户端
-    participant P as 代理网关
-    participant ES as 边侧调度器
+    participant C as Actor
+    participant P as API_Server
+    participant ES as Edge_Scheduler
     participant EW as 边侧NPUWorker
     participant HCCL as HCCL PP通道
     participant CW as 云侧NPUWorker
